@@ -1,0 +1,13 @@
+# Variáveis de ambiente e credenciais (NVIDIA API Key)
+.env
+*.key
+
+# Ambientes virtuais do Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Pastas temporárias geradas pelos clones e pelos relatórios PDF
+/tmp/
+*.pdf
