@@ -3,10 +3,15 @@ import re
 import shutil
 import tempfile
 import urllib.request
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel
 from git import Repo
+
+# Carrega a chave de API do arquivo .env
+load_dotenv()
 
 app = FastAPI(title="Vibe Security Auditor API")
 
@@ -18,8 +23,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Modelos para validação das requisições
 class ScanRequest(BaseModel):
     repo_url: str
+
+class ExplainRequest(BaseModel):
+    tipo: str
+    mensagem: str
+    arquivo: str
+    linha: int
 
 def check_pypi_package(package_name: str) -> bool:
     """Verifica se o pacote existe no registro oficial do PyPI."""
@@ -52,7 +64,6 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
     total_vulns = 0
     total_secrets = 0
 
-    # Padrões para identificar segredos (API Keys, Tokens)
     padroes_secrets = [
         (r'sk-[a-zA-Z0-9]{32,}', "Chave de API OpenAI Exposta", "CRITICA"),
         (r'AKIA[0-9A-Z]{16}', "Chave de Acesso AWS Exposta", "CRITICA"),
@@ -60,7 +71,6 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
         (r'(?i)(password|senha|secret)\s*=\s*[\'"][^\'"]+[\'"]', "Senha/Segredo Hardcoded", "ALTA")
     ]
 
-    # Padrões para identificar vulnerabilidades comuns de código gerado por IA
     padroes_vulns = [
         (r'\beval\(', "Uso do método eval()", "ALTA", "Execução arbitrária de código Python."),
         (r'\bexec\(', "Uso do método exec()", "ALTA", "Execução dinâmica de código sem validação."),
@@ -69,6 +79,11 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
     ]
 
     for raiz, _, ficheiros in os.walk(diretorio):
+        # Ignora a própria pasta backend e ambientes virtuais para evitar falsos positivos
+        partes_caminho = raiz.split(os.sep)
+        if "backend" in partes_caminho or ".venv" in partes_caminho or "venv" in partes_caminho:
+            continue
+
         for ficheiro in ficheiros:
             if ficheiro.endswith(".py"):
                 caminho_completo = os.path.join(raiz, ficheiro)
@@ -79,7 +94,6 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
                         linhas = f.readlines()
 
                     for num_linha, linha in enumerate(linhas, start=1):
-                        # Checagem de Secrets
                         for padrao, tipo, gravidade in padroes_secrets:
                             if re.search(padrao, linha):
                                 total_secrets += 1
@@ -91,7 +105,6 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
                                     "mensagem": "Credencial sensível detetada no código-fonte."
                                 })
 
-                        # Checagem de Vulnerabilidades
                         for padrao, tipo, gravidade, msg in padroes_vulns:
                             if re.search(padrao, linha):
                                 total_vulns += 1
@@ -117,7 +130,7 @@ def realizar_scan(dados: ScanRequest):
         # 1. Clonar repositório
         Repo.clone_from(dados.repo_url, temp_dir, depth=1)
         
-        # 2. Análise de pacotes (requirements.txt)
+        # 2. Análise de pacotes
         req_path = os.path.join(temp_dir, "requirements.txt")
         pacotes_encontrados = extrair_pacotes_requirements(req_path)
         
@@ -141,13 +154,11 @@ def realizar_scan(dados: ScanRequest):
                 "mensagem": f"O pacote '{pkg_fake}' não existe no PyPI. Risco de Typosquatting/Dependency Confusion."
             })
 
-        # 3. Análise dos arquivos de código (.py)
+        # 3. Análise do código Python
         achados_codigo, vulns, secrets = escanear_codigo_python(temp_dir)
-
-        # Junta todos os achados
         todos_achados = achados_pacotes + achados_codigo
 
-        # Cálculo do Score de Segurança
+        # Cálculo de Score
         deducoes = (qtd_alucinados * 25) + (secrets * 20) + (vulns * 15)
         score = max(100 - deducoes, 0)
 
@@ -169,3 +180,44 @@ def realizar_scan(dados: ScanRequest):
     
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@app.post("/api/v1/explain")
+def explicar_com_ia(dados: ExplainRequest):
+    api_key = os.getenv("NVIDIA_API_KEY")
+    
+    if not api_key:
+        return {"resposta": "⚠️ Chave NVIDIA_API_KEY não encontrada no arquivo .env."}
+
+    try:
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key
+        )
+
+        prompt = f"""
+Você é um especialista sênior em segurança de software.
+Foi encontrada a seguinte vulnerabilidade no projeto:
+
+- Tipo: {dados.tipo}
+- Arquivo: {dados.arquivo} (Linha {dados.linha})
+- Detalhes: {dados.mensagem}
+
+Responda em Português de forma clara e objetiva:
+1. Explicação curta do risco (máximo 2 frases).
+2. Exemplo de código seguro para corrigir o problema.
+"""
+
+        completion = client.chat.completions.create(
+            model="meta/llama-3.2-90b-vision-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=400
+        )
+
+        return {"resposta": completion.choices[0].message.content}
+
+    except Exception as e:
+        return {"resposta": f"Erro ao consultar NVIDIA NIM: {str(e)}"}
+
+    OPENAI_KEY = "sk-1234567890abcdef1234567890abcdef"
