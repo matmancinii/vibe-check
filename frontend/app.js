@@ -117,3 +117,27 @@ async function pedirAjudaIA(tipo, mensagem, arquivo, linha, idElemento) {
         console.error(error);
     }
 }
+
+let ultimoResultadoScan = null;
+
+// Salva o resultado no window para poder exportar no PDF
+// (Adicione esta linha dentro do executarScan(), logo após const data = await response.json();)
+ultimoResultadoScan = data;
+
+async function baixarRelatorioPDF() {
+    if (!ultimoResultadoScan) {
+        alert("Realize uma análise antes de exportar o relatório!");
+        return;
+    }
+
+    const response = await fetch('http://127.0.0.1:8000/api/v1/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ultimoResultadoScan)
+    });
+
+    const htmlContent = await response.text();
+    const win = window.open('', '_blank');
+    win.document.write(htmlContent);
+    win.document.close();
+}

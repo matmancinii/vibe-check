@@ -219,3 +219,73 @@ Responda em Português de forma clara e objetiva:
 
     except Exception as e:
         return {"resposta": f"Erro ao consultar NVIDIA NIM: {str(e)}"}
+
+from fastapi.responses import HTMLResponse
+
+@app.post("/api/v1/report", response_class=HTMLResponse)
+def gerar_relatorio_html(dados: dict):
+    """Gera um relatório formatado em HTML/PDF pronto para impressão ou download."""
+    metricas = dados.get("metricas", {})
+    achados = dados.get("achados_seguranca", [])
+    repo = dados.get("repositorio", "N/A")
+
+    linhas_achados = ""
+    for item in achados:
+        linhas_achados += f"""
+        <tr style="border-bottom: 1px solid #ddd;">
+            <td style="padding: 8px; font-weight: bold; color: #e11d48;">{item.get('gravidade')}</td>
+            <td style="padding: 8px;">{item.get('tipo')}</td>
+            <td style="padding: 8px; font-family: monospace;">{item.get('arquivo')}:{item.get('linha')}</td>
+            <td style="padding: 8px;">{item.get('mensagem')}</td>
+        </tr>
+        """
+
+    if not linhas_achados:
+        linhas_achados = '<tr><td colspan="4" style="text-align:center; padding: 15px; color: #059669;">Nenhuma vulnerabilidade encontrada. Repositório Seguro!</td></tr>'
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>Relatório Executivo de Segurança</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 30px; color: #333; }}
+            h1 {{ color: #4f46e5; border-bottom: 2px solid #4f46e5; padding-bottom: 5px; }}
+            .metrics {{ display: flex; gap: 15px; margin: 20px 0; }}
+            .card {{ background: #f3f4f6; padding: 15px; border-radius: 8px; flex: 1; text-align: center; }}
+            .card h3 {{ margin: 0; font-size: 24px; color: #1f2937; }}
+            table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+            th {{ background: #1e293b; color: white; padding: 10px; text-align: left; }}
+        </style>
+    </head>
+    <body>
+        <h1>🛡️ Relatório Executivo de Auditoria de Segurança</h1>
+        <p><strong>Repositório Auditado:</strong> {repo}</p>
+        
+        <div class="metrics">
+            <div class="card"><p>Score de Segurança</p><h3>{metricas.get('pontuacao_seguranca', 0)}/100</h3></div>
+            <div class="card"><p>Vulnerabilidades</p><h3>{metricas.get('vulnerabilidades', 0)}</h3></div>
+            <div class="card"><p>Secrets Expostos</p><h3>{metricas.get('segredos_expostos', 0)}</h3></div>
+            <div class="card"><p>Pacotes Alucinados</p><h3>{metricas.get('pacotes_alucinados', 0)}</h3></div>
+        </div>
+
+        <h2>Detalhamento dos Achados</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Gravidade</th>
+                    <th>Tipo</th>
+                    <th>Localização</th>
+                    <th>Descrição</th>
+                </tr>
+            </thead>
+            <tbody>
+                {linhas_achados}
+            </tbody>
+        </table>
+        <script>window.onload = function() {{ window.print(); }}</script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
