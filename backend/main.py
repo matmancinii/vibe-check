@@ -219,5 +219,3 @@ Responda em Português de forma clara e objetiva:
 
     except Exception as e:
         return {"resposta": f"Erro ao consultar NVIDIA NIM: {str(e)}"}
-
-    OPENAI_KEY = "sk-1234567890abcdef1234567890abcdef"
