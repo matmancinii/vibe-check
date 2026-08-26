@@ -289,3 +289,26 @@ def gerar_relatorio_html(dados: dict):
     </html>
     """
     return HTMLResponse(content=html_content)
+
+import json
+import subprocess
+
+def escanear_com_semgrep(diretorio: str) -> tuple[list[dict], int]:
+    """Executa o Semgrep no diretório temporário e retorna os achados em JSON."""
+    try:
+        cmd = ["semgrep", "scan", "--config=p/python", "--json", diretorio]
+        resultado = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        dados = json.loads(resultado.stdout)
+
+        achados = []
+        for item in dados.get("results", []):
+            achados.append({
+                "tipo": item.get("check_id", "Vulnerabilidade Semgrep"),
+                "gravidade": "CRITICA" if item.get("extra", {}).get("severity") == "ERROR" else "ALTA",
+                "arquivo": item.get("path"),
+                "linha": item.get("start", {}).get("line", 1),
+                "mensagem": item.get("extra", {}).get("message", "Falha detectada pelo Semgrep.")
+            })
+        return achados, len(achados)
+    except Exception:
+        return [], 0
