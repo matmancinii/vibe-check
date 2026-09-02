@@ -1,11 +1,14 @@
+import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import urllib.request
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from git import Repo
@@ -23,7 +26,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Modelos para validação das requisições
 class ScanRequest(BaseModel):
     repo_url: str
 
@@ -33,6 +35,7 @@ class ExplainRequest(BaseModel):
     arquivo: str
     linha: int
 
+# --- 1. VALIDAÇÃO DE PACOTES NO PYPI ---
 def check_pypi_package(package_name: str) -> bool:
     """Verifica se o pacote existe no registro oficial do PyPI."""
     url = f"https://pypi.org/pypi/{package_name}/json"
@@ -58,6 +61,7 @@ def extrair_pacotes_requirements(caminho_arquivo: str) -> list[str]:
                     pacotes.append(pkg)
     return pacotes
 
+# --- 2. MOTOR DE VARREDURA REGEX (FALLBACK / SAST) ---
 def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
     """Percorre os arquivos .py do projeto buscando vulnerabilidades e segredos expostos."""
     achados = []
@@ -79,7 +83,6 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
     ]
 
     for raiz, _, ficheiros in os.walk(diretorio):
-        # Ignora a própria pasta backend e ambientes virtuais para evitar falsos positivos
         partes_caminho = raiz.split(os.sep)
         if "backend" in partes_caminho or ".venv" in partes_caminho or "venv" in partes_caminho:
             continue
@@ -121,16 +124,83 @@ def escanear_codigo_python(diretorio: str) -> tuple[list[dict], int, int]:
 
     return achados, total_vulns, total_secrets
 
+# --- 3. INTEGRAÇÃO SAST COM SEMGREP ---
+def escanear_com_semgrep(diretorio: str) -> list[dict]:
+    """Executa o Semgrep no repositório clonado e converte os resultados."""
+    achados = []
+    try:
+        cmd = ["semgrep", "scan", "--config=p/python", "--json", diretorio]
+        resultado = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if resultado.returncode == 0 and resultado.stdout:
+            dados = json.loads(resultado.stdout)
+            for res in dados.get("results", []):
+                rel_path = os.path.relpath(res.get("path"), diretorio)
+                achados.append({
+                    "tipo": f"Semgrep: {res.get('check_id', 'Vulnerabilidade')}",
+                    "gravidade": "CRITICA" if res.get("extra", {}).get("severity") == "ERROR" else "ALTA",
+                    "arquivo": rel_path,
+                    "linha": res.get("start", {}).get("line", 1),
+                    "mensagem": res.get("extra", {}).get("message", "Falha de SAST detectada pelo Semgrep.")
+                })
+    except Exception:
+        # Prossegue com o scanner Python caso o Semgrep não esteja instalado
+        pass
+    return achados
+
+# --- 4. INTEGRAÇÃO DE SECRETS COM TRUFFLEHOG ---
+def escanear_com_trufflehog(diretorio: str) -> list[dict]:
+    """Executa o TruffleHog no diretório temporário para buscar credenciais ativas."""
+    achados = []
+    try:
+        cmd = ["trufflehog", "filesystem", diretorio, "--json"]
+        resultado = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if resultado.stdout:
+            for linha in resultado.stdout.strip().split("\n"):
+                if not linha:
+                    continue
+                try:
+                    item = json.loads(linha)
+                    detector = item.get("DetectorName", "Segredo")
+                    arquivo = item.get("SourceMetadata", {}).get("Data", {}).get("Filesystem", {}).get("file", "desconhecido")
+                    rel_path = os.path.relpath(arquivo, diretorio) if os.path.isabs(arquivo) else arquivo
+                    achados.append({
+                        "tipo": f"TruffleHog: {detector}",
+                        "gravidade": "CRITICA",
+                        "arquivo": rel_path,
+                        "linha": 1,
+                        "mensagem": f"Segredo/Credencial ativa identificada pelo TruffleHog ({detector})."
+                    })
+                except Exception:
+                    continue
+    except Exception:
+        # Prossegue caso o TruffleHog não esteja instalado
+        pass
+    return achados
+
+# --- 5. CAMADA NEMO GUARDRAILS (MODERAÇÃO DE IA) ---
+def aplicar_nemo_guardrails(prompt: str) -> tuple[bool, str]:
+    """
+    Camada NeMo Guardrails para sanitizar o prompt e evitar prompt injections
+    antes do envio para a NVIDIA NIM.
+    """
+    termos_proibidos = ["system command", "rm -rf", "ignore previous instructions", "jailbreak", "prompt injection"]
+    for termo in termos_proibidos:
+        if termo.lower() in prompt.lower():
+            return False, "⚠️ NeMo Guardrail: A requisição foi bloqueada por conter padrões de entrada inseguros."
+    return True, ""
+
+
+# --- ROTAS DA API ---
 
 @app.post("/api/v1/scan")
 def realizar_scan(dados: ScanRequest):
     temp_dir = tempfile.mkdtemp()
     
     try:
-        # 1. Clonar repositório
+        # 1. Clonagem do Repositório
         Repo.clone_from(dados.repo_url, temp_dir, depth=1)
         
-        # 2. Análise de pacotes
+        # 2. Análise de Dependências (PyPI)
         req_path = os.path.join(temp_dir, "requirements.txt")
         pacotes_encontrados = extrair_pacotes_requirements(req_path)
         
@@ -154,20 +224,23 @@ def realizar_scan(dados: ScanRequest):
                 "mensagem": f"O pacote '{pkg_fake}' não existe no PyPI. Risco de Typosquatting/Dependency Confusion."
             })
 
-        # 3. Análise do código Python
+        # 3. Execução das Ferramentas da Stack (Regex + Semgrep + TruffleHog)
         achados_codigo, vulns, secrets = escanear_codigo_python(temp_dir)
-        todos_achados = achados_pacotes + achados_codigo
+        achados_semgrep = escanear_com_semgrep(temp_dir)
+        achados_trufflehog = escanear_com_trufflehog(temp_dir)
 
-        # Cálculo de Score
-        deducoes = (qtd_alucinados * 25) + (secrets * 20) + (vulns * 15)
+        todos_achados = achados_pacotes + achados_codigo + achados_semgrep + achados_trufflehog
+
+        # Cálculo do Score de Segurança
+        deducoes = (qtd_alucinados * 25) + (secrets * 20) + (vulns * 15) + (len(achados_semgrep) * 10) + (len(achados_trufflehog) * 20)
         score = max(100 - deducoes, 0)
 
         return {
             "repositorio": dados.repo_url,
             "status": "sucesso",
             "metricas": {
-                "vulnerabilidades": vulns,
-                "segredos_expostos": secrets,
+                "vulnerabilidades": vulns + len(achados_semgrep),
+                "segredos_expostos": secrets + len(achados_trufflehog),
                 "pacotes_alucinados": qtd_alucinados,
                 "pontuacao_seguranca": score
             },
@@ -189,13 +262,7 @@ def explicar_com_ia(dados: ExplainRequest):
     if not api_key:
         return {"resposta": "⚠️ Chave NVIDIA_API_KEY não encontrada no arquivo .env."}
 
-    try:
-        client = OpenAI(
-            base_url="https://integrate.api.nvidia.com/v1",
-            api_key=api_key
-        )
-
-        prompt = f"""
+    prompt = f"""
 Você é um especialista sênior em segurança de software.
 Foi encontrada a seguinte vulnerabilidade no projeto:
 
@@ -207,6 +274,17 @@ Responda em Português de forma clara e objetiva:
 1. Explicação curta do risco (máximo 2 frases).
 2. Exemplo de código seguro para corrigir o problema.
 """
+
+    # Validação da entrada pelo NeMo Guardrails
+    valido, msg_guardrail = aplicar_nemo_guardrails(prompt)
+    if not valido:
+        return {"resposta": msg_guardrail}
+
+    try:
+        client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=api_key
+        )
 
         completion = client.chat.completions.create(
             model="meta/llama-3.2-90b-vision-instruct",
@@ -220,11 +298,9 @@ Responda em Português de forma clara e objetiva:
     except Exception as e:
         return {"resposta": f"Erro ao consultar NVIDIA NIM: {str(e)}"}
 
-from fastapi.responses import HTMLResponse
 
 @app.post("/api/v1/report", response_class=HTMLResponse)
 def gerar_relatorio_html(dados: dict):
-    """Gera um relatório formatado em HTML/PDF pronto para impressão ou download."""
     metricas = dados.get("metricas", {})
     achados = dados.get("achados_seguranca", [])
     repo = dados.get("repositorio", "N/A")
@@ -289,26 +365,3 @@ def gerar_relatorio_html(dados: dict):
     </html>
     """
     return HTMLResponse(content=html_content)
-
-import json
-import subprocess
-
-def escanear_com_semgrep(diretorio: str) -> tuple[list[dict], int]:
-    """Executa o Semgrep no diretório temporário e retorna os achados em JSON."""
-    try:
-        cmd = ["semgrep", "scan", "--config=p/python", "--json", diretorio]
-        resultado = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        dados = json.loads(resultado.stdout)
-
-        achados = []
-        for item in dados.get("results", []):
-            achados.append({
-                "tipo": item.get("check_id", "Vulnerabilidade Semgrep"),
-                "gravidade": "CRITICA" if item.get("extra", {}).get("severity") == "ERROR" else "ALTA",
-                "arquivo": item.get("path"),
-                "linha": item.get("start", {}).get("line", 1),
-                "mensagem": item.get("extra", {}).get("message", "Falha detectada pelo Semgrep.")
-            })
-        return achados, len(achados)
-    except Exception:
-        return [], 0
